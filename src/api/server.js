@@ -323,14 +323,48 @@ function cleanPm2Proc(proc) {
   };
 }
 
-async function getBotPowerStatuses() {
+async function getPm2ProcessMap() {
   const { stdout } = await runPm2(["jlist"]);
   const list = JSON.parse(stdout || "[]");
-  const byName = new Map(list.map((proc) => [proc.name, cleanPm2Proc(proc)]));
+  return new Map(list.map((proc) => [proc.name, cleanPm2Proc(proc)]));
+}
+
+async function getBotPowerStatuses() {
+  const byName = await getPm2ProcessMap();
   return Object.values(botPowerTargets).map((target) => ({
     ...target,
     ...(byName.get(target.pm2Name) || { pm2Name: target.pm2Name, status: "missing", online: false, restarts: 0, uptime: null, cpu: 0, memoryMb: 0 }),
   }));
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runBotPowerAction(target, action) {
+  if (action === "status") return;
+  const before = await getPm2ProcessMap();
+  const proc = before.get(target.pm2Name);
+  const pm2Ref = proc?.pmId === null || proc?.pmId === undefined ? target.pm2Name : String(proc.pmId);
+  console.log("[bot-power]", action, target.name, "pm2Ref=", pm2Ref, "before=", proc?.status || "missing");
+
+  if (action === "stop") {
+    await runPm2(["stop", pm2Ref]);
+    for (let i = 0; i < 8; i += 1) {
+      await wait(500);
+      const current = (await getPm2ProcessMap()).get(target.pm2Name);
+      if (!current || current.status === "stopped") {
+        console.log("[bot-power] stop verified", target.name, current?.status || "missing");
+        return;
+      }
+    }
+    const current = (await getPm2ProcessMap()).get(target.pm2Name);
+    throw new Error(`${target.name} did not stop. Current PM2 status: ${current?.status || "missing"}.`);
+  }
+
+  await runPm2([action, pm2Ref]);
+  await wait(800);
+  console.log("[bot-power]", action, "sent", target.name);
 }
 
 async function handleBotPower(req, res, dashboardPassword) {
@@ -343,7 +377,7 @@ async function handleBotPower(req, res, dashboardPassword) {
   if (!target) return fail(res, 400, "Unknown bot target.");
   if (!botPowerActions.has(action)) return fail(res, 400, "Unknown bot power action.");
 
-  if (action !== "status") await runPm2([action, target.pm2Name]);
+  await runBotPowerAction(target, action);
 
   const statuses = await getBotPowerStatuses();
   ok(res, { action, botId, target, statuses, updatedAt: new Date().toISOString() });
