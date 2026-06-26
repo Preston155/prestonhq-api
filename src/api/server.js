@@ -31,6 +31,140 @@ function fail(res, status, message) {
   return res.status(status).json({ ok: false, error: message });
 }
 
+
+const giveawaySources = [
+  { botId: "ecrp", botName: "ECRP Assistant", databasePath: "/root/bots/bot4/src/data/giveaways.sqlite" },
+  { botId: "veltrix", botName: "Veltrix", databasePath: "/root/bots/bot3/src/data/giveaways.sqlite" },
+];
+
+let sqliteModule = null;
+function getSqlite() {
+  if (sqliteModule) return sqliteModule;
+  const candidates = [
+    "better-sqlite3",
+    "/root/bots/bot4/node_modules/better-sqlite3",
+    "/root/bots/bot3/node_modules/better-sqlite3",
+  ];
+  for (const candidate of candidates) {
+    try {
+      sqliteModule = require(candidate);
+      return sqliteModule;
+    } catch {
+      /* try next */
+    }
+  }
+  throw new Error("better-sqlite3 is not available to read giveaway data.");
+}
+
+function giveawayDbExists(file) {
+  try {
+    return fsNative.existsSync(file) && fsNative.statSync(file).size > 0;
+  } catch {
+    return false;
+  }
+}
+
+function readGiveawaysFromSource(source) {
+  if (!giveawayDbExists(source.databasePath)) return [];
+  const Database = getSqlite();
+  const db = new Database(source.databasePath, { readonly: true, fileMustExist: true });
+  try {
+    const rows = db.prepare(`
+      SELECT
+        id, guild_id, channel_id, message_id, prize, description, host_id, host_name,
+        sponsor_id, winner_count, image_url, status, start_time, end_time, remaining_ms,
+        created_by, created_at
+      FROM giveaways
+      WHERE status IN ('active', 'paused')
+      ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, end_time ASC
+      LIMIT 25
+    `).all();
+
+    const entryStats = db.prepare(`
+      SELECT COUNT(*) AS users, COALESCE(SUM(weight), 0) AS weighted
+      FROM giveaway_entries
+      WHERE giveaway_id = ?
+    `);
+    const entries = db.prepare(`
+      SELECT user_id, weight, entered_at
+      FROM giveaway_entries
+      WHERE giveaway_id = ?
+      ORDER BY entered_at ASC
+      LIMIT 50
+    `);
+
+    return rows.map((row) => {
+      const stats = entryStats.get(row.id) || { users: 0, weighted: 0 };
+      return {
+        botId: source.botId,
+        botName: source.botName,
+        id: row.id,
+        guildId: row.guild_id,
+        channelId: row.channel_id,
+        messageId: row.message_id || null,
+        prize: row.prize,
+        description: row.description || "",
+        hostId: row.host_id,
+        hostName: row.host_name || "Unknown host",
+        sponsorId: row.sponsor_id || null,
+        winnerCount: row.winner_count,
+        imageUrl: row.image_url || null,
+        status: row.status,
+        startTime: row.start_time,
+        endTime: row.end_time,
+        remainingMs: row.remaining_ms,
+        createdAt: row.created_at,
+        entries: {
+          users: Number(stats.users || 0),
+          weighted: Number(stats.weighted || 0),
+          visible: entries.all(row.id).map((entry) => ({
+            userId: entry.user_id,
+            weight: Number(entry.weight || 1),
+            enteredAt: entry.entered_at,
+          })),
+        },
+      };
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function hydrateGiveawayUsers(client, giveaways) {
+  const ids = [...new Set(giveaways.flatMap((giveaway) => giveaway.entries.visible.map((entry) => entry.userId)).filter(Boolean))].slice(0, 150);
+  const userMap = new Map();
+  await Promise.all(ids.map(async (id) => {
+    const user = await client.users.fetch(id).catch(() => null);
+    if (user) userMap.set(id, { id, username: user.username, tag: user.tag, displayName: user.globalName || user.username, avatarUrl: user.displayAvatarURL?.({ size: 64 }) || null });
+  }));
+  return giveaways.map((giveaway) => ({
+    ...giveaway,
+    entries: {
+      ...giveaway.entries,
+      visible: giveaway.entries.visible.map((entry) => ({
+        ...entry,
+        user: userMap.get(entry.userId) || { id: entry.userId, username: "Unknown user", tag: entry.userId, displayName: "Unknown user", avatarUrl: null },
+      })),
+    },
+  }));
+}
+
+async function getActiveGiveaways(client) {
+  const giveaways = giveawaySources.flatMap((source) => {
+    try {
+      return readGiveawaysFromSource(source);
+    } catch (error) {
+      console.error("Failed to read giveaways for " + source.botName + ":", error.message);
+      return [];
+    }
+  });
+  giveaways.sort((a, b) => {
+    if (a.status !== b.status) return a.status === "active" ? -1 : 1;
+    return Number(a.endTime || 0) - Number(b.endTime || 0);
+  });
+  return hydrateGiveawayUsers(client, giveaways);
+}
+
 function color(value, fallback = 0x0b1f4d) {
   if (typeof value === "number") return value;
   const parsed = Number.parseInt(String(value || "").replace("#", ""), 16);
@@ -122,7 +256,7 @@ async function sendWelcomeTest(guild, settings, requesterId) {
 
 function resolveAllowedOrigins(frontendOrigin, publicApiBaseUrl) {
   const origins = new Set();
-  for (const raw of [frontendOrigin, publicApiBaseUrl, "https://api.prestonhq.com", "http://localhost:3001"]) {
+  for (const raw of [frontendOrigin, publicApiBaseUrl, "https://api.prestonhq.com", "https://prestonhq.com", "https://www.prestonhq.com", "http://localhost:3001"]) {
     if (!raw) continue;
     try {
       origins.add(new URL(String(raw).replace(/\/$/, "")).origin);
@@ -235,6 +369,12 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
   app.use(session({ store: new MemoryStore({ checkPeriod: 86400000 }), name: "nexora_sid", secret: sessionSecret, resave: false, saveUninitialized: false, cookie: { httpOnly: true, secure: isProduction, sameSite: cookieSameSite, domain: cookieDomain || undefined, maxAge: 1000 * 60 * 60 * 24 * 7 } }));
 
   app.get("/api/health", (_req, res) => ok(res, { botReady: client.isReady(), botUser: client.user?.tag || null, guildCount: client.guilds.cache.size, uptime: Math.floor(process.uptime()) }));
+
+  app.get("/api/giveaways/active", asyncRoute(async (_req, res) => {
+    const giveaways = await getActiveGiveaways(client);
+    res.set("Cache-Control", "public, max-age=15, stale-while-revalidate=30");
+    ok(res, { updatedAt: new Date().toISOString(), count: giveaways.length, giveaways });
+  }));
   app.post("/api/auth/login", asyncRoute((req, res) => authRouter.login(req, res)));
   app.get("/api/auth/me", authRouter.getAuthMe);
   app.post("/api/auth/logout", authRouter.logout);
