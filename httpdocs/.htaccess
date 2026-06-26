@@ -1,0 +1,19 @@
+# PrestonHQ dashboard — Cybrancee / Apache
+DirectoryIndex index.html
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+
+  # Serve existing files and folders as-is
+  RewriteCond %{REQUEST_FILENAME} -f [OR]
+  RewriteCond %{REQUEST_FILENAME} -d
+  RewriteRule ^ - [L]
+
+  # Optional SPA-style fallback for /dashboard/* subpaths
+  RewriteRule ^dashboard/.*$ /dashboard/index.html [L]
+</IfModule>
+
+<IfModule mod_headers.c>
+  # Allow API cookies on cross-origin requests from prestonhq.com
+  Header always set Access-Control-Allow-Credentials "true"
+</IfModule>

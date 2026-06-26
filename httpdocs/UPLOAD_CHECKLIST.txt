@@ -1,0 +1,30 @@
+PRESTONHQ — CYBRANCEE UPLOAD CHECKLIST
+======================================
+
+Your site root (httpdocs) MUST contain ALL of these paths:
+
+  httpdocs/index.html
+  httpdocs/.htaccess
+  httpdocs/dashboard/index.html
+  httpdocs/assets/css/app.css
+  httpdocs/assets/js/config.js
+  httpdocs/assets/js/api.js
+  httpdocs/assets/js/dashboard.js
+
+VERIFY IN BROWSER (all must show 200, NOT 404):
+  https://prestonhq.com/assets/js/config.js
+  https://prestonhq.com/assets/js/api.js
+  https://prestonhq.com/assets/js/dashboard.js
+  https://prestonhq.com/assets/css/app.css
+
+COMMON MISTAKE:
+  Uploading only dashboard/ without the assets/ folder.
+  Putting assets inside dashboard/assets/ (WRONG).
+
+CORRECT structure on server:
+  httpdocs/
+    assets/          <-- at ROOT, same level as dashboard/
+    dashboard/
+    index.html
+
+After upload: Ctrl+Shift+R hard refresh on dashboard page.

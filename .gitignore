@@ -1,0 +1,31 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# dependencies / build output
+node_modules/
+dist/
+build/
+.cache/
+coverage/
+
+# runtime data
+src/data/*
+!src/data/.gitkeep
+logs/
+*.log
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+
+# generated/private web artifacts
+httpdocs/bot-logs/
+src/data/logs/
+src/data/transcripts/
+src/data/developer-log-key
+src/data/developer-log-cleared-at
+
+# backups often contain old env files
+backups/
