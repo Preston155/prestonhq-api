@@ -282,6 +282,7 @@ function mountDashboard(app, httpdocsRoot) {
 const botPowerTargets = {
   ecrp: { id: "ecrp", name: "ECRP Assistant", pm2Name: "bot4" },
   veltrix: { id: "veltrix", name: "Veltrix", pm2Name: "bot3" },
+  icesway: { id: "icesway", name: "IceSway Utils", pm2Name: "bot2" },
 };
 const botPowerActions = new Set(["status", "start", "stop", "restart"]);
 
