@@ -36,6 +36,7 @@ function fail(res, status, message) {
 const giveawaySources = [
   { botId: "ecrp", botName: "ECRP Assistant", databasePath: "/root/bots/bot4/src/data/giveaways.sqlite" },
   { botId: "veltrix", botName: "Veltrix", databasePath: "/root/bots/bot3/src/data/giveaways.sqlite" },
+  { botId: "icesway", botName: "IceSway Utils", databasePath: "/root/bots/bot2/src/data/giveaways.sqlite" },
 ];
 
 let sqliteModule = null;
@@ -45,6 +46,7 @@ function getSqlite() {
     "better-sqlite3",
     "/root/bots/bot4/node_modules/better-sqlite3",
     "/root/bots/bot3/node_modules/better-sqlite3",
+    "/root/bots/bot2/node_modules/better-sqlite3",
   ];
   for (const candidate of candidates) {
     try {
