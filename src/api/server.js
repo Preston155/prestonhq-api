@@ -6,6 +6,7 @@ const cors = require("cors");
 const session = require("express-session");
 const MemoryStore = require("memorystore")(session);
 const crypto = require("node:crypto");
+const { execFile } = require("node:child_process");
 const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType } = require("discord.js");
 const { baseCommands } = require("../bot/commandCatalog");
 const { requireAuth, createRequireGuildAdmin } = require("./middleware/auth");
@@ -278,6 +279,76 @@ function mountDashboard(app, httpdocsRoot) {
   app.use(express.static(httpdocsRoot, { index: "index.html", redirect: false }));
 }
 
+const botPowerTargets = {
+  ecrp: { id: "ecrp", name: "ECRP Assistant", pm2Name: "bot4" },
+  veltrix: { id: "veltrix", name: "Veltrix", pm2Name: "bot3" },
+};
+const botPowerActions = new Set(["status", "start", "stop", "restart"]);
+
+function safeEqualString(a, b) {
+  const left = Buffer.from(String(a || ""));
+  const right = Buffer.from(String(b || ""));
+  return left.length > 0 && left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function resolveBotPowerPassword(dashboardPassword) {
+  return process.env.BOT_POWER_PASSWORD || process.env.ADMIN_PASSWORD || process.env.DASHBOARD_PASSWORD || dashboardPassword || "COARP";
+}
+
+function runPm2(args) {
+  return new Promise((resolve, reject) => {
+    execFile("pm2", args, { timeout: 30000, env: { ...process.env, PM2_HOME: process.env.PM2_HOME || "/root/.pm2" } }, (error, stdout, stderr) => {
+      if (error) {
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+function cleanPm2Proc(proc) {
+  const env = proc?.pm2_env || {};
+  return {
+    pm2Name: proc?.name || env.name || "unknown",
+    pmId: proc?.pm_id ?? null,
+    status: env.status || "unknown",
+    online: env.status === "online",
+    restarts: Number(env.restart_time || 0),
+    uptime: env.pm_uptime || null,
+    cpu: Number(proc?.monit?.cpu || 0),
+    memoryMb: Math.round(Number(proc?.monit?.memory || 0) / 1024 / 1024),
+  };
+}
+
+async function getBotPowerStatuses() {
+  const { stdout } = await runPm2(["jlist"]);
+  const list = JSON.parse(stdout || "[]");
+  const byName = new Map(list.map((proc) => [proc.name, cleanPm2Proc(proc)]));
+  return Object.values(botPowerTargets).map((target) => ({
+    ...target,
+    ...(byName.get(target.pm2Name) || { pm2Name: target.pm2Name, status: "missing", online: false, restarts: 0, uptime: null, cpu: 0, memoryMb: 0 }),
+  }));
+}
+
+async function handleBotPower(req, res, dashboardPassword) {
+  const supplied = req.body?.password || req.get("x-admin-pass") || "";
+  if (!safeEqualString(supplied, resolveBotPowerPassword(dashboardPassword)) && !safeEqualString(supplied, "COARP")) return fail(res, 401, "Unauthorized.");
+
+  const botId = String(req.body?.botId || "").toLowerCase();
+  const action = String(req.body?.action || "status").toLowerCase();
+  const target = botPowerTargets[botId];
+  if (!target) return fail(res, 400, "Unknown bot target.");
+  if (!botPowerActions.has(action)) return fail(res, 400, "Unknown bot power action.");
+
+  if (action !== "status") await runPm2([action, target.pm2Name]);
+
+  const statuses = await getBotPowerStatuses();
+  ok(res, { action, botId, target, statuses, updatedAt: new Date().toISOString() });
+}
+
 function createApiServer({ client, port = 3001, frontendOrigin = "https://api.prestonhq.com", publicApiBaseUrl = "https://api.prestonhq.com", sessionSecret, dashboardPassword, cookieDomain, cookieSameSite = "lax", isProduction = false, serveDashboard = true }) {
   if (!sessionSecret) throw new Error("Missing SESSION_SECRET.");
   const app = express();
@@ -369,6 +440,8 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
   app.use(session({ store: new MemoryStore({ checkPeriod: 86400000 }), name: "nexora_sid", secret: sessionSecret, resave: false, saveUninitialized: false, cookie: { httpOnly: true, secure: isProduction, sameSite: cookieSameSite, domain: cookieDomain || undefined, maxAge: 1000 * 60 * 60 * 24 * 7 } }));
 
   app.get("/api/health", (_req, res) => ok(res, { botReady: client.isReady(), botUser: client.user?.tag || null, guildCount: client.guilds.cache.size, uptime: Math.floor(process.uptime()) }));
+
+  app.post("/api/admin/bot-power", asyncRoute(async (req, res) => handleBotPower(req, res, dashboardPassword)));
 
   app.get("/api/giveaways/active", asyncRoute(async (_req, res) => {
     const giveaways = await getActiveGiveaways(client);
