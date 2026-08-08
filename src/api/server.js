@@ -19,6 +19,8 @@ const { getGuildCustomReplies, createCustomReply, updateCustomReply, deleteCusto
 const { getGuildSettings, updateGuildSettings, getMainSettings, patchMainSettings, getSectionSettings, patchSectionSettings, getSectionList, appendSectionListItem, updateSectionListItem, getGiveaways, patchGiveaway } = require("../services/guildSettingsService");
 const { isValidCommandName, cleanText, isDiscordId } = require("../utils/validation");
 const { sendGuildMessage } = require("./messageBuilder");
+const prc = require("./prcClient");
+const moderationStore = require("../services/moderationStore");
 
 function asyncRoute(handler) {
   return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
@@ -30,6 +32,68 @@ function ok(res, data, status = 200) {
 
 function fail(res, status, message) {
   return res.status(status).json({ ok: false, error: message });
+}
+
+function settledValue(result, fallback) {
+  return result.status === "fulfilled" ? result.value : fallback;
+}
+
+function getPrcPlayerName(player) {
+  return String(player?.Player || player?.player || player?.Username || player?.username || player?.Name || player?.name || "Unknown");
+}
+
+function normalizePrcPlayer(player) {
+  const rawName = getPrcPlayerName(player);
+  const match = rawName.match(/^(.*?)\s*:\s*(\d+)$/);
+  const username = String(player?.Username || player?.username || match?.[1] || rawName).trim();
+  const id = String(player?.PlayerId || player?.playerId || player?.UserId || player?.userId || match?.[2] || username);
+  const permission = String(player?.Permission || player?.permission || player?.PermissionName || "Normal");
+  return {
+    id,
+    name: username,
+    robloxId: id,
+    team: String(player?.Team || player?.team || player?.TeamName || "Civilian"),
+    callsign: String(player?.Callsign || player?.callsign || ""),
+    permission,
+    staff: !/^(normal|none|player|civilian)$/i.test(permission),
+    raw: player,
+  };
+}
+
+async function persistEnvValue(filePath, key, value) {
+  const raw = await fsPromises.readFile(filePath, "utf8").catch((error) => {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  });
+  const safeValue = String(value || "").trim();
+  if (!/^[A-Z0-9_]+$/.test(key) || !safeValue || /[\r\n]/.test(safeValue)) throw new Error("Invalid environment value.");
+  const lines = raw.split(/\r?\n/);
+  let found = false;
+  const next = lines.map((line) => {
+    if (line.startsWith(key + "=")) {
+      found = true;
+      return key + "=" + safeValue;
+    }
+    return line;
+  });
+  if (!found) next.push("", "# ERLC / PRC API", key + "=" + safeValue);
+  const temp = filePath + ".tmp";
+  await fsPromises.writeFile(temp, next.join("\n").replace(/\n+$/, "") + "\n", { mode: 0o600 });
+  await fsPromises.rename(temp, filePath);
+}
+
+function createModerationCommand(action, target, reason) {
+  const safeReason = String(reason || "No reason provided").replace(/[\r\n]+/g, " ").trim().slice(0, 180);
+  const commands = {
+    Kick: `:kick ${target} ${safeReason}`,
+    Ban: `:ban ${target} ${safeReason}`,
+    Unban: `:unban ${target}`,
+    Kill: `:kill ${target}`,
+    Teleport: `:bring ${target}`,
+    PM: `:pm ${target} ${safeReason}`,
+    Announcement: `:h ${safeReason}`,
+  };
+  return commands[action] || null;
 }
 
 
@@ -275,6 +339,12 @@ function resolveAllowedOrigins(frontendOrigin, publicApiBaseUrl) {
 
 function mountDashboard(app, httpdocsRoot) {
   const dashboardIndex = path.join(httpdocsRoot, "dashboard", "index.html");
+  const giveawayImageRoot = "/root/bots/shared/giveaway-images";
+  app.use("/giveaway-images", express.static(giveawayImageRoot, {
+    fallthrough: false,
+    immutable: true,
+    maxAge: "365d",
+  }));
   app.get(["/dashboard", "/dashboard/"], (_req, res) => {
     res.sendFile(dashboardIndex);
   });
@@ -478,6 +548,12 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
 
   app.get("/api/health", (_req, res) => ok(res, { botReady: client.isReady(), botUser: client.user?.tag || null, guildCount: client.guilds.cache.size, uptime: Math.floor(process.uptime()) }));
 
+  app.get("/api/bots/status", asyncRoute(async (_req, res) => {
+    const statuses = await getBotPowerStatuses();
+    const bots = Object.fromEntries(statuses.map((entry) => [entry.id, entry]));
+    ok(res, { bots, updatedAt: new Date().toISOString() });
+  }));
+
   app.post("/api/admin/bot-power", asyncRoute(async (req, res) => handleBotPower(req, res, dashboardPassword)));
 
   app.get("/api/giveaways/active", asyncRoute(async (_req, res) => {
@@ -487,9 +563,87 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
   }));
   app.post("/api/auth/login", asyncRoute((req, res) => authRouter.login(req, res)));
   app.get("/api/auth/me", authRouter.getAuthMe);
+  app.get("/api/auth/validate-sso", (req, res) => {
+    ok(res, {
+      authenticated: Boolean(req.session?.authenticated),
+      user: req.session?.user || null,
+      checkedAt: new Date().toISOString(),
+    });
+  });
   app.post("/api/auth/logout", authRouter.logout);
   app.post("/api/debug/client", asyncRoute((req, res) => debugRouter.clientLog(req, res)));
   app.get("/api/debug/logs", debugRouter.getLogs);
+
+  app.use("/api/erlc", requireAuth(sessionSecret));
+  app.post("/api/erlc/connect", asyncRoute(async (req, res) => {
+    const apiKey = String(req.body?.apiKey || "").trim();
+    if (apiKey.length < 12 || apiKey.length > 300 || /[\r\n]/.test(apiKey)) return fail(res, 400, "Enter a valid PRC API key.");
+    const previous = process.env.ERLC_API_KEY || "";
+    process.env.ERLC_API_KEY = apiKey;
+    try {
+      await prc.getServer();
+    } catch (error) {
+      process.env.ERLC_API_KEY = previous;
+      throw error;
+    }
+    await persistEnvValue("/root/bots/bot6/.env", "ERLC_API_KEY", apiKey);
+    const staff = { id: req.session.user?.id || "dashboard-admin", name: req.session.user?.globalName || req.session.user?.username || "Dashboard Admin" };
+    await moderationStore.addAudit({ action: "erlc_api_connected", actor: staff, entityId: null, details: { configured: true } });
+    ok(res, { configured: true, connected: true, message: "ER:LC server connected." });
+  }));
+
+  app.get("/api/erlc/overview", asyncRoute(async (req, res) => {
+    if (!prc.configured()) return ok(res, { configured: false, connected: false, server: null, players: [], queue: [], commandLogs: [], modCalls: [], updatedAt: new Date().toISOString() });
+    const results = await Promise.allSettled([prc.getServer(), prc.getPlayers(), prc.getQueue(), prc.getCommandLogs(), prc.getModCalls()]);
+    if (results[0].status === "rejected") throw results[0].reason;
+    const rawPlayers = settledValue(results[1], []);
+    const players = (Array.isArray(rawPlayers) ? rawPlayers : []).map(normalizePrcPlayer);
+    res.set("Cache-Control", "private, no-store");
+    ok(res, {
+      configured: true,
+      connected: true,
+      server: settledValue(results[0], null),
+      players,
+      queue: settledValue(results[2], []),
+      commandLogs: settledValue(results[3], []),
+      modCalls: settledValue(results[4], []),
+      stats: { players: players.length, staff: players.filter((player) => player.staff).length, queue: Array.isArray(settledValue(results[2], [])) ? settledValue(results[2], []).length : 0 },
+      warnings: results.slice(1).filter((result) => result.status === "rejected").map((result) => result.reason?.message || "Partial ER:LC sync failed."),
+      updatedAt: new Date().toISOString(),
+    });
+  }));
+  app.get("/api/erlc/players", asyncRoute(async (_req, res) => {
+    const players = await prc.getPlayers();
+    ok(res, { players: (Array.isArray(players) ? players : []).map(normalizePrcPlayer), updatedAt: new Date().toISOString() });
+  }));
+  app.get("/api/erlc/logs", asyncRoute(async (req, res) => {
+    const [commandLogs, modCalls, audit, cases] = await Promise.all([prc.getCommandLogs().catch(() => []), prc.getModCalls().catch(() => []), moderationStore.listAudit(req.query.limit), moderationStore.listCases(req.query.limit)]);
+    ok(res, { commandLogs, modCalls, audit, cases, updatedAt: new Date().toISOString() });
+  }));
+  app.get("/api/erlc/cases", asyncRoute(async (req, res) => ok(res, { cases: await moderationStore.listCases(req.query.limit) })));
+  app.get("/api/erlc/audit", asyncRoute(async (req, res) => ok(res, { audit: await moderationStore.listAudit(req.query.limit) })));
+  app.post("/api/erlc/actions", asyncRoute(async (req, res) => {
+    const action = cleanText(req.body?.action, 40);
+    const target = cleanText(req.body?.target, 40);
+    const reason = cleanText(req.body?.reason || "No reason provided", 180);
+    const allowed = new Set(["Kick", "Ban", "Unban", "Kill", "Teleport", "PM", "Announcement"]);
+    if (!allowed.has(action)) return fail(res, 400, "Unsupported moderation action.");
+    if (action !== "Announcement" && !/^[A-Za-z0-9_]{3,20}$/.test(target)) return fail(res, 400, "Enter a valid Roblox username.");
+    if (!reason.trim()) return fail(res, 400, "A reason or message is required.");
+    const command = createModerationCommand(action, target, reason);
+    const staff = { id: req.session.user?.id || "dashboard-admin", name: req.session.user?.globalName || req.session.user?.username || "Dashboard Admin" };
+    const result = await prc.executeCommand(command);
+    const moderationCase = await moderationStore.addCase({ type: action, target: action === "Announcement" ? "Server" : target, reason, staff, command, result: result || null });
+    ok(res, { executed: true, action, target: action === "Announcement" ? "Server" : target, case: moderationCase, result }, 201);
+  }));
+  app.post("/api/erlc/command", asyncRoute(async (req, res) => {
+    const command = cleanText(req.body?.command, 300).trim();
+    if (!/^:[A-Za-z][A-Za-z0-9-]*(?:\s|$)/.test(command)) return fail(res, 400, "Enter a valid ER:LC command beginning with a colon.");
+    const staff = { id: req.session.user?.id || "dashboard-admin", name: req.session.user?.globalName || req.session.user?.username || "Dashboard Admin" };
+    const result = await prc.executeCommand(command);
+    await moderationStore.addAudit({ action: "raw_command_executed", actor: staff, entityId: null, details: { command } });
+    ok(res, { executed: true, command, result }, 201);
+  }));
 
   app.use("/api/guilds", requireAuth(sessionSecret));
   app.get("/api/guilds", asyncRoute(async (req, res) => {
