@@ -1,4 +1,4 @@
-const BASE_URL = String(process.env.PRC_API_BASE_URL || "https://api.policeroleplay.community/v1").replace(/\/$/, "");
+const BASE_URL = String(process.env.PRC_API_BASE_URL || "https://api.erlc.gg/v1").replace(/\/$/, "");
 
 class PrcApiError extends Error {
   constructor(message, status = 502, code = "PRC_ERROR") {
