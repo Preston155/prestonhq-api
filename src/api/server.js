@@ -22,6 +22,44 @@ const { sendGuildMessage } = require("./messageBuilder");
 const prc = require("./prcClient");
 const moderationStore = require("../services/moderationStore");
 
+const robloxAvatarCache = new Map();
+const ROBLOX_AVATAR_CACHE_MS = 6 * 60 * 60 * 1000;
+
+async function getRobloxAvatarHeadshot(robloxId) {
+  const cached = robloxAvatarCache.get(robloxId);
+  if (cached && cached.expiresAt > Date.now()) return cached.imageUrl;
+
+  const endpoint = new URL("https://thumbnails.roblox.com/v1/users/avatar-headshot");
+  endpoint.search = new URLSearchParams({
+    userIds: robloxId,
+    size: "150x150",
+    format: "Png",
+    isCircular: "true",
+  }).toString();
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(endpoint, {
+      signal: controller.signal,
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) throw new Error(`Roblox thumbnails returned ${response.status}`);
+    const payload = await response.json();
+    const thumbnail = payload?.data?.[0];
+    const imageUrl = thumbnail?.state === "Completed" && thumbnail?.imageUrl
+      ? String(thumbnail.imageUrl)
+      : null;
+    robloxAvatarCache.set(robloxId, {
+      imageUrl,
+      expiresAt: Date.now() + ROBLOX_AVATAR_CACHE_MS,
+    });
+    return imageUrl;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function asyncRoute(handler) {
   return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 }
@@ -547,6 +585,14 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
   app.use(session({ store: new MemoryStore({ checkPeriod: 86400000 }), name: "nexora_sid", secret: sessionSecret, resave: false, saveUninitialized: false, cookie: { httpOnly: true, secure: isProduction, sameSite: cookieSameSite, domain: cookieDomain || undefined, maxAge: 1000 * 60 * 60 * 24 * 7 } }));
 
   app.get("/api/health", (_req, res) => ok(res, { botReady: client.isReady(), botUser: client.user?.tag || null, guildCount: client.guilds.cache.size, uptime: Math.floor(process.uptime()) }));
+
+  app.get("/api/roblox/avatar/:robloxId", asyncRoute(async (req, res) => {
+    const robloxId = String(req.params.robloxId || "").trim();
+    if (!/^\d{1,20}$/.test(robloxId)) return fail(res, 400, "A valid Roblox user ID is required.");
+    const imageUrl = await getRobloxAvatarHeadshot(robloxId);
+    res.set("Cache-Control", "public, max-age=3600, stale-while-revalidate=86400");
+    return ok(res, { robloxId, imageUrl });
+  }));
 
   app.get("/api/bots/status", asyncRoute(async (_req, res) => {
     const statuses = await getBotPowerStatuses();
