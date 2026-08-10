@@ -462,6 +462,88 @@ async function getBotPowerStatuses() {
   }));
 }
 
+function tableCount(db, sql, fallback = 0) {
+  try {
+    return Number(db.prepare(sql).get()?.count || fallback);
+  } catch {
+    return fallback;
+  }
+}
+
+async function getVeltrixDashboard(client) {
+  const statuses = await getBotPowerStatuses();
+  const processStatus = statuses.find((entry) => entry.id === "veltrix") || {
+    id: "veltrix",
+    name: "Veltrix",
+    pm2Name: "bot3",
+    status: "missing",
+    online: false,
+    restarts: 0,
+    uptime: null,
+    cpu: 0,
+    memoryMb: 0,
+  };
+  const source = giveawaySources.find((entry) => entry.botId === "veltrix");
+  const activeGiveaways = (await getActiveGiveaways(client)).filter((entry) => entry.botId === "veltrix");
+  const summary = {
+    activeSessions: 0,
+    staffOnDuty: 0,
+    moderationCases: 0,
+    activeWarnings: 0,
+    verifiedMembers: 0,
+    staffProfiles: 0,
+    pendingLeaveRequests: 0,
+    activeStrikes: 0,
+  };
+  let recentStaffActivity = [];
+  let database = { connected: false, integrity: "unavailable", sizeBytes: 0 };
+
+  if (source && giveawayDbExists(source.databasePath)) {
+    const Database = getSqlite();
+    const db = new Database(source.databasePath, { readonly: true, fileMustExist: true });
+    try {
+      database = {
+        connected: true,
+        integrity: String(db.pragma("integrity_check", { simple: true }) || "unknown"),
+        sizeBytes: fsNative.statSync(source.databasePath).size,
+      };
+      summary.activeSessions = tableCount(db, "SELECT COUNT(*) AS count FROM sessions WHERE status IN ('voting', 'active', 'started')");
+      summary.staffOnDuty = tableCount(db, "SELECT COUNT(*) AS count FROM staff_active_shifts");
+      summary.moderationCases = tableCount(db, "SELECT COUNT(*) AS count FROM moderation_cases");
+      summary.activeWarnings = tableCount(db, "SELECT COUNT(*) AS count FROM warnings WHERE active = 1");
+      summary.verifiedMembers = tableCount(db, "SELECT COUNT(*) AS count FROM roblox_verifications");
+      summary.staffProfiles = tableCount(db, "SELECT COUNT(*) AS count FROM staff_profiles");
+      summary.pendingLeaveRequests = tableCount(db, "SELECT COUNT(*) AS count FROM staff_loa_requests WHERE status = 'pending'");
+      summary.activeStrikes = tableCount(db, "SELECT COUNT(*) AS count FROM staff_strikes WHERE active = 1");
+      recentStaffActivity = db.prepare(`
+        SELECT id, actor_id AS actorId, target_id AS targetId, action, details, created_at AS createdAt
+        FROM staff_audit_logs
+        ORDER BY created_at DESC
+        LIMIT 12
+      `).all();
+    } finally {
+      db.close();
+    }
+  }
+
+  return {
+    bot: processStatus,
+    database,
+    summary: { ...summary, activeGiveaways: activeGiveaways.length },
+    giveaways: activeGiveaways,
+    recentStaffActivity,
+    systems: [
+      { id: "giveaways", name: "Advanced Giveaways", healthy: database.connected },
+      { id: "staff", name: "Staff Operations V2", healthy: database.connected },
+      { id: "sessions", name: "ER:LC Sessions", healthy: database.connected },
+      { id: "verification", name: "Roblox Verification", healthy: processStatus.online },
+      { id: "counting", name: "Advanced Counting", healthy: processStatus.online },
+      { id: "tickets", name: "Ticket System", healthy: processStatus.online },
+    ],
+    updatedAt: new Date().toISOString(),
+  };
+}
+
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -722,6 +804,12 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
           : null,
       },
     });
+  }));
+
+  app.get("/api/erlc/bot-dashboard/veltrix", asyncRoute(async (_req, res) => {
+    const dashboard = await getVeltrixDashboard(client);
+    res.set("Cache-Control", "private, no-store");
+    ok(res, dashboard);
   }));
 
   app.post("/api/erlc/cad/calls", asyncRoute(async (req, res) => {
