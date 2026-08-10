@@ -470,6 +470,46 @@ function tableCount(db, sql, fallback = 0) {
   }
 }
 
+function veltrixDatabaseSource() {
+  const source = giveawaySources.find((entry) => entry.botId === "veltrix");
+  if (!source || !giveawayDbExists(source.databasePath)) return null;
+  return source;
+}
+
+function veltrixGuildId(db) {
+  const tables = ["staff_profiles", "staff_active_shifts", "staff_audit_logs", "moderation_cases"];
+  for (const table of tables) {
+    try {
+      const row = db.prepare(`SELECT guild_id AS guildId FROM ${table} WHERE guild_id IS NOT NULL ORDER BY rowid DESC LIMIT 1`).get();
+      if (row?.guildId) return String(row.guildId);
+    } catch {}
+  }
+  return null;
+}
+
+async function resolveDiscordUsers(client, ids) {
+  const unique = [...new Set(ids.filter((id) => /^\d{17,20}$/.test(String(id || ""))).map(String))].slice(0, 80);
+  const entries = await Promise.all(unique.map(async (userId) => {
+    try {
+      const user = client.users.cache.get(userId) || await client.users.fetch(userId);
+      return [userId, {
+        id: userId,
+        name: user.globalName || user.username,
+        username: user.username,
+        avatarUrl: user.displayAvatarURL({ extension: "png", size: 128 }),
+      }];
+    } catch {
+      return [userId, { id: userId, name: `User ${userId.slice(-4)}`, username: userId, avatarUrl: null }];
+    }
+  }));
+  return Object.fromEntries(entries);
+}
+
+function parseAuditDetails(value) {
+  if (!value) return null;
+  try { return JSON.parse(value); } catch { return { note: String(value) }; }
+}
+
 async function getVeltrixDashboard(client) {
   const statuses = await getBotPowerStatuses();
   const processStatus = statuses.find((entry) => entry.id === "veltrix") || {
@@ -496,6 +536,13 @@ async function getVeltrixDashboard(client) {
     activeStrikes: 0,
   };
   let recentStaffActivity = [];
+  let activeShifts = [];
+  let shiftHistory = [];
+  let warningHistory = [];
+  let strikeHistory = [];
+  let moderationHistory = [];
+  let staffProfiles = [];
+  let guildId = null;
   let database = { connected: false, integrity: "unavailable", sizeBytes: 0 };
 
   if (source && giveawayDbExists(source.databasePath)) {
@@ -515,22 +562,78 @@ async function getVeltrixDashboard(client) {
       summary.staffProfiles = tableCount(db, "SELECT COUNT(*) AS count FROM staff_profiles");
       summary.pendingLeaveRequests = tableCount(db, "SELECT COUNT(*) AS count FROM staff_loa_requests WHERE status = 'pending'");
       summary.activeStrikes = tableCount(db, "SELECT COUNT(*) AS count FROM staff_strikes WHERE active = 1");
+      guildId = veltrixGuildId(db);
       recentStaffActivity = db.prepare(`
         SELECT id, actor_id AS actorId, target_id AS targetId, action, details, created_at AS createdAt
         FROM staff_audit_logs
         ORDER BY created_at DESC
         LIMIT 12
       `).all();
+      activeShifts = db.prepare(`
+        SELECT s.guild_id AS guildId, s.user_id AS userId, s.started_at AS startedAt,
+          COALESCE(p.points, 0) AS points, COALESCE(p.total_ms, 0) AS totalMs,
+          COALESCE(p.shifts, 0) AS completedShifts
+        FROM staff_active_shifts s
+        LEFT JOIN staff_profiles p ON p.guild_id = s.guild_id AND p.user_id = s.user_id
+        ORDER BY s.started_at ASC LIMIT 50
+      `).all();
+      shiftHistory = db.prepare(`
+        SELECT id, guild_id AS guildId, user_id AS userId, started_at AS startedAt,
+          ended_at AS endedAt, duration_ms AS durationMs, points, ended_by AS endedBy, reason
+        FROM staff_shift_history ORDER BY ended_at DESC LIMIT 30
+      `).all();
+      warningHistory = db.prepare(`
+        SELECT warning_id AS id, case_id AS caseId, guild_id AS guildId, user_id AS userId,
+          moderator_id AS moderatorId, reason, created_at AS createdAt, active,
+          removed_by AS removedBy, removed_at AS removedAt, removal_reason AS removalReason
+        FROM warnings ORDER BY created_at DESC LIMIT 30
+      `).all();
+      strikeHistory = db.prepare(`
+        SELECT id, guild_id AS guildId, user_id AS userId, points, reason, issued_by AS issuedBy,
+          created_at AS createdAt, active, removed_by AS removedBy, removed_at AS removedAt,
+          removal_reason AS removalReason
+        FROM staff_strikes ORDER BY created_at DESC LIMIT 30
+      `).all();
+      moderationHistory = db.prepare(`
+        SELECT case_id AS id, case_number AS caseNumber, user_id AS userId,
+          moderator_id AS moderatorId, action_type AS action, reason, created_at AS createdAt, active, removed
+        FROM moderation_cases ORDER BY created_at DESC LIMIT 30
+      `).all();
+      staffProfiles = db.prepare(`
+        SELECT guild_id AS guildId, user_id AS userId, points, total_ms AS totalMs,
+          shifts AS completedShifts, last_start AS lastStart, last_end AS lastEnd
+        FROM staff_profiles ORDER BY points DESC, total_ms DESC LIMIT 80
+      `).all();
     } finally {
       db.close();
     }
   }
+
+  recentStaffActivity = recentStaffActivity.map((entry) => ({ ...entry, details: parseAuditDetails(entry.details) }));
+  const userIds = [
+    ...activeShifts.flatMap((entry) => [entry.userId]),
+    ...shiftHistory.flatMap((entry) => [entry.userId, entry.endedBy]),
+    ...warningHistory.flatMap((entry) => [entry.userId, entry.moderatorId, entry.removedBy]),
+    ...strikeHistory.flatMap((entry) => [entry.userId, entry.issuedBy, entry.removedBy]),
+    ...moderationHistory.flatMap((entry) => [entry.userId, entry.moderatorId]),
+    ...staffProfiles.flatMap((entry) => [entry.userId]),
+    ...recentStaffActivity.flatMap((entry) => [entry.actorId, entry.targetId]),
+  ];
+  const users = await resolveDiscordUsers(client, userIds);
 
   return {
     bot: processStatus,
     database,
     summary: { ...summary, activeGiveaways: activeGiveaways.length },
     giveaways: activeGiveaways,
+    guildId,
+    users,
+    activeShifts,
+    shiftHistory,
+    warningHistory,
+    strikeHistory,
+    moderationHistory,
+    staffProfiles,
     recentStaffActivity,
     systems: [
       { id: "giveaways", name: "Advanced Giveaways", healthy: database.connected },
@@ -542,6 +645,61 @@ async function getVeltrixDashboard(client) {
     ],
     updatedAt: new Date().toISOString(),
   };
+}
+
+function requireVeltrixUserId(value) {
+  const userId = String(value || "").trim();
+  if (!/^\d{17,20}$/.test(userId)) throw Object.assign(new Error("Enter a valid Discord user ID."), { statusCode: 400 });
+  return userId;
+}
+
+function updateVeltrixShift({ action, userId, actor, reason }) {
+  const source = veltrixDatabaseSource();
+  if (!source) throw Object.assign(new Error("Veltrix staff database is unavailable."), { statusCode: 503 });
+  const Database = getSqlite();
+  const db = new Database(source.databasePath, { fileMustExist: true });
+  db.pragma("busy_timeout = 5000");
+  try {
+    const guildId = veltrixGuildId(db);
+    if (!guildId) throw Object.assign(new Error("Veltrix guild could not be identified from Staff Operations."), { statusCode: 409 });
+    const now = Date.now();
+    const safeReason = cleanText(reason || (action === "start" ? "Started from PrestonHQ" : "Ended from PrestonHQ"), 240).trim();
+    const transaction = db.transaction(() => {
+      db.prepare(`
+        INSERT INTO staff_profiles (guild_id, user_id, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(guild_id, user_id) DO NOTHING
+      `).run(guildId, userId, now);
+      const active = db.prepare("SELECT * FROM staff_active_shifts WHERE guild_id = ? AND user_id = ?").get(guildId, userId);
+      if (action === "start") {
+        if (active) throw Object.assign(new Error("That staff member already has an active shift."), { statusCode: 409 });
+        db.prepare("INSERT INTO staff_active_shifts (guild_id, user_id, started_at) VALUES (?, ?, ?)").run(guildId, userId, now);
+        db.prepare("UPDATE staff_profiles SET last_start = ?, updated_at = ? WHERE guild_id = ? AND user_id = ?").run(now, now, guildId, userId);
+        const details = { source: "prestonhq_dashboard", startedAt: now, reason: safeReason };
+        db.prepare("INSERT INTO staff_audit_logs (guild_id, actor_id, target_id, action, details, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+          .run(guildId, actor.id, userId, "shift_started_dashboard", JSON.stringify(details), now);
+        return { action, guildId, userId, startedAt: now, reason: safeReason };
+      }
+      if (!active) throw Object.assign(new Error("That staff member does not have an active shift."), { statusCode: 409 });
+      const durationMs = Math.max(0, now - Number(active.started_at));
+      const points = durationMs < 60000 ? 0 : 1 + Math.floor(durationMs / 3600000) * 2;
+      db.prepare(`
+        UPDATE staff_profiles SET points = points + ?, total_ms = total_ms + ?, shifts = shifts + 1,
+          last_end = ?, updated_at = ? WHERE guild_id = ? AND user_id = ?
+      `).run(points, durationMs, now, now, guildId, userId);
+      db.prepare(`
+        INSERT INTO staff_shift_history (guild_id, user_id, started_at, ended_at, duration_ms, points, ended_by, reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(guildId, userId, active.started_at, now, durationMs, points, actor.id, safeReason || null);
+      db.prepare("DELETE FROM staff_active_shifts WHERE guild_id = ? AND user_id = ?").run(guildId, userId);
+      const details = { source: "prestonhq_dashboard", startedAt: active.started_at, endedAt: now, durationMs, points, reason: safeReason };
+      db.prepare("INSERT INTO staff_audit_logs (guild_id, actor_id, target_id, action, details, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(guildId, actor.id, userId, "shift_ended_dashboard", JSON.stringify(details), now);
+      return { action, guildId, userId, startedAt: active.started_at, endedAt: now, durationMs, points, reason: safeReason };
+    });
+    return transaction();
+  } finally {
+    db.close();
+  }
 }
 
 function wait(ms) {
@@ -810,6 +968,36 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
     const dashboard = await getVeltrixDashboard(client);
     res.set("Cache-Control", "private, no-store");
     ok(res, dashboard);
+  }));
+
+  app.post("/api/erlc/bot-dashboard/veltrix/shifts/start", asyncRoute(async (req, res) => {
+    try {
+      const result = updateVeltrixShift({
+        action: "start",
+        userId: requireVeltrixUserId(req.body?.userId),
+        actor: dashboardActor(req),
+        reason: req.body?.reason,
+      });
+      await moderationStore.addAudit({ action: "veltrix_shift_started", actor: dashboardActor(req), entityId: result.userId, details: result });
+      ok(res, result, 201);
+    } catch (error) {
+      fail(res, error.statusCode || 500, error.statusCode ? error.message : "The shift could not be started.");
+    }
+  }));
+
+  app.post("/api/erlc/bot-dashboard/veltrix/shifts/end", asyncRoute(async (req, res) => {
+    try {
+      const result = updateVeltrixShift({
+        action: "end",
+        userId: requireVeltrixUserId(req.body?.userId),
+        actor: dashboardActor(req),
+        reason: req.body?.reason,
+      });
+      await moderationStore.addAudit({ action: "veltrix_shift_ended", actor: dashboardActor(req), entityId: result.userId, details: result });
+      ok(res, result);
+    } catch (error) {
+      fail(res, error.statusCode || 500, error.statusCode ? error.message : "The shift could not be ended.");
+    }
   }));
 
   app.post("/api/erlc/cad/calls", asyncRoute(async (req, res) => {
