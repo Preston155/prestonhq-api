@@ -21,6 +21,7 @@ const { isValidCommandName, cleanText, isDiscordId } = require("../utils/validat
 const { sendGuildMessage } = require("./messageBuilder");
 const prc = require("./prcClient");
 const moderationStore = require("../services/moderationStore");
+const dashboardOperations = require("../services/dashboardOperationsStore");
 
 const robloxAvatarCache = new Map();
 const ROBLOX_AVATAR_CACHE_MS = 6 * 60 * 60 * 1000;
@@ -132,6 +133,19 @@ function createModerationCommand(action, target, reason) {
     Announcement: `:h ${safeReason}`,
   };
   return commands[action] || null;
+}
+
+function dashboardActor(req) {
+  return {
+    id: req.session?.user?.id || "dashboard-admin",
+    name: req.session?.user?.globalName || req.session?.user?.username || "Dashboard Admin",
+  };
+}
+
+function safeSecretMatch(supplied, expected) {
+  const left = Buffer.from(String(supplied || ""));
+  const right = Buffer.from(String(expected || ""));
+  return left.length > 15 && left.length === right.length && crypto.timingSafeEqual(left, right);
 }
 
 
@@ -620,6 +634,26 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
   app.post("/api/debug/client", asyncRoute((req, res) => debugRouter.clientLog(req, res)));
   app.get("/api/debug/logs", debugRouter.getLogs);
 
+  // ER:LC's event logger cannot hold a dashboard session, so this receiver is
+  // authenticated by a long random URL secret. The secret is never returned by
+  // this public route and duplicate event deliveries are ignored by the store.
+  app.post("/api/erlc/events/:secret", asyncRoute(async (req, res) => {
+    const expected = process.env.ERLC_EVENT_WEBHOOK_SECRET || "";
+    if (!safeSecretMatch(req.params.secret, expected)) return fail(res, 403, "Invalid event webhook.");
+    const dashboardState = await dashboardOperations.getDashboardState();
+    if (!dashboardState.settings.eventWebhookEnabled) return res.status(204).end();
+    const result = await dashboardOperations.ingestWebhook(req.body || {});
+    if (result.call) {
+      await moderationStore.addAudit({
+        action: "cad_call_ingested",
+        actor: { id: "event-webhook", name: "ER:LC Event Log" },
+        entityId: result.call.id,
+        details: { source: result.call.source, caller: result.call.caller, location: result.call.location },
+      });
+    }
+    return res.status(204).end();
+  }));
+
   app.use("/api/erlc", requireAuth(sessionSecret));
   app.post("/api/erlc/connect", asyncRoute(async (req, res) => {
     const apiKey = String(req.body?.apiKey || "").trim();
@@ -668,6 +702,139 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
   }));
   app.get("/api/erlc/cases", asyncRoute(async (req, res) => ok(res, { cases: await moderationStore.listCases(req.query.limit) })));
   app.get("/api/erlc/audit", asyncRoute(async (req, res) => ok(res, { audit: await moderationStore.listAudit(req.query.limit) })));
+
+  app.get("/api/erlc/cad", asyncRoute(async (_req, res) => {
+    let state = await dashboardOperations.getDashboardState();
+    let ingested = [];
+    if (state.settings.ingestModCalls && prc.configured()) {
+      const modCalls = await prc.getModCalls().catch(() => []);
+      ingested = await dashboardOperations.syncModCalls(modCalls);
+      if (ingested.length) state = await dashboardOperations.getDashboardState();
+    }
+    res.set("Cache-Control", "private, no-store");
+    ok(res, {
+      ...state,
+      ingested: ingested.length,
+      eventWebhook: {
+        configured: Boolean(process.env.ERLC_EVENT_WEBHOOK_SECRET),
+        url: process.env.ERLC_EVENT_WEBHOOK_SECRET
+          ? `${publicApiBaseUrl.replace(/\/$/, "")}/api/erlc/events/${process.env.ERLC_EVENT_WEBHOOK_SECRET}`
+          : null,
+      },
+    });
+  }));
+
+  app.post("/api/erlc/cad/calls", asyncRoute(async (req, res) => {
+    const type = cleanText(req.body?.type || req.body?.title, 160).trim();
+    const location = cleanText(req.body?.location, 160).trim();
+    const description = cleanText(req.body?.description || req.body?.details, 1000).trim();
+    if (type.length < 3) return fail(res, 400, "Call title must be at least 3 characters.");
+    if (location.length < 2) return fail(res, 400, "Call location is required.");
+    if (description.length < 3) return fail(res, 400, "Call details are required.");
+    const actor = dashboardActor(req);
+    const call = await dashboardOperations.createCall({
+      type,
+      location,
+      description,
+      priority: req.body?.priority,
+      caller: req.body?.caller || actor.name,
+      source: "dashboard",
+    }, actor);
+    let broadcast = { attempted: false, delivered: false, error: null };
+    const state = await dashboardOperations.getDashboardState();
+    if (state.settings.broadcastCadToServer && prc.configured()) {
+      broadcast.attempted = true;
+      const command = `:h [${call.id} • ${call.priority}] ${call.type} @ ${call.location} — ${call.description}`.slice(0, 295);
+      try {
+        await prc.executeCommand(command);
+        broadcast.delivered = true;
+      } catch (error) {
+        broadcast.error = error.message;
+      }
+    }
+    await moderationStore.addAudit({
+      action: "cad_call_created",
+      actor,
+      entityId: call.id,
+      details: { type: call.type, location: call.location, priority: call.priority, broadcast },
+    });
+    ok(res, { call, broadcast }, 201);
+  }));
+
+  app.patch("/api/erlc/cad/calls/:callId", asyncRoute(async (req, res) => {
+    const actor = dashboardActor(req);
+    const call = await dashboardOperations.updateCall(req.params.callId, {
+      status: req.body?.status,
+      assignedUnits: req.body?.assignedUnits,
+      addUnit: req.body?.addUnit,
+      removeUnit: req.body?.removeUnit,
+    }, actor);
+    if (!call) return fail(res, 404, "CAD call not found.");
+    if (req.body?.announce && prc.configured()) {
+      const units = call.assignedUnits.length ? call.assignedUnits.join(", ") : "units pending";
+      await prc.executeCommand(`:h [${call.id}] ${call.status} — ${units}`.slice(0, 295)).catch(() => null);
+    }
+    await moderationStore.addAudit({
+      action: "cad_call_updated",
+      actor,
+      entityId: call.id,
+      details: { status: call.status, assignedUnits: call.assignedUnits },
+    });
+    ok(res, { call });
+  }));
+
+  app.get("/api/erlc/cad/records", asyncRoute(async (req, res) => {
+    ok(res, { records: await dashboardOperations.searchRecords(req.query.q || "") });
+  }));
+
+  app.post("/api/erlc/cad/records", asyncRoute(async (req, res) => {
+    const citizenName = cleanText(req.body?.citizenName || req.body?.target, 80).trim();
+    const notes = cleanText(req.body?.notes, 2000).trim();
+    if (!/^[A-Za-z0-9_]{3,20}$/.test(citizenName)) return fail(res, 400, "Enter a valid Roblox username.");
+    if (notes.length < 3) return fail(res, 400, "Officer notes are required.");
+    const actor = dashboardActor(req);
+    const record = await dashboardOperations.createRecord({
+      citizenName,
+      robloxId: req.body?.robloxId,
+      classification: req.body?.classification,
+      notes,
+      warrants: req.body?.warrants,
+      priors: req.body?.priors,
+      licenses: req.body?.licenses,
+      vehicle: req.body?.vehicle,
+    }, actor);
+    await moderationStore.addAudit({ action: "cad_record_created", actor, entityId: record.id, details: { citizenName, classification: record.classification } });
+    ok(res, { record }, 201);
+  }));
+
+  app.patch("/api/erlc/cad/units/:unitId", asyncRoute(async (req, res) => {
+    const actor = dashboardActor(req);
+    const unit = await dashboardOperations.setUnitStatus(req.params.unitId, req.body?.unitName, req.body?.status, actor);
+    await moderationStore.addAudit({ action: "cad_unit_status_updated", actor, entityId: unit.unitId, details: { unitName: unit.unitName, status: unit.status } });
+    ok(res, { unit });
+  }));
+
+  app.get("/api/erlc/dashboard-config", asyncRoute(async (_req, res) => {
+    const state = await dashboardOperations.getDashboardState();
+    ok(res, {
+      permissions: state.permissions,
+      settings: state.settings,
+      eventWebhook: {
+        configured: Boolean(process.env.ERLC_EVENT_WEBHOOK_SECRET),
+        url: process.env.ERLC_EVENT_WEBHOOK_SECRET
+          ? `${publicApiBaseUrl.replace(/\/$/, "")}/api/erlc/events/${process.env.ERLC_EVENT_WEBHOOK_SECRET}`
+          : null,
+      },
+    });
+  }));
+
+  app.patch("/api/erlc/dashboard-config", asyncRoute(async (req, res) => {
+    const actor = dashboardActor(req);
+    const config = await dashboardOperations.updateConfig(req.body || {});
+    await moderationStore.addAudit({ action: "dashboard_config_updated", actor, entityId: null, details: { sections: Object.keys(req.body || {}) } });
+    ok(res, config);
+  }));
+
   app.post("/api/erlc/actions", asyncRoute(async (req, res) => {
     const action = cleanText(req.body?.action, 40);
     const target = cleanText(req.body?.target, 40);
