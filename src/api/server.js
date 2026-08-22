@@ -1263,10 +1263,10 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
     const inventoryId = shopText(req.body?.inventoryId, 80);
     const quantity = shopNumber(req.body?.quantity, "Sale quantity", { integer: true, min: 1, max: 10000 });
     const unitPrice = shopNumber(req.body?.unitPrice, "Sale price", { max: 100000 });
-    const adjustInventory = req.body?.adjustInventory !== false;
     const soldAt = new Date(req.body?.soldAt || Date.now());
     if (!Number.isFinite(soldAt.getTime())) throw new Error("Sale date is invalid.");
     if (soldAt.getTime() > Date.now() + 86400000) throw new Error("Sale date cannot be in the future.");
+    const adjustInventory = easternDateKey(soldAt) === easternDateKey();
     const actor = dashboardActor(req);
     const data = await mutateTireShop((shop) => {
       const item = shop.inventory.find((entry) => entry.id === inventoryId);
@@ -1300,10 +1300,10 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
     const inventoryId = shopText(req.body?.inventoryId, 80);
     const quantity = shopNumber(req.body?.quantity, "Sale quantity", { integer: true, min: 1, max: 10000 });
     const unitPrice = shopNumber(req.body?.unitPrice, "Sale price", { max: 100000 });
-    const adjustInventory = req.body?.adjustInventory !== false;
     const soldAt = new Date(req.body?.soldAt || Date.now());
     if (!Number.isFinite(soldAt.getTime())) throw new Error("Sale date is invalid.");
     if (soldAt.getTime() > Date.now() + 86400000) throw new Error("Sale date cannot be in the future.");
+    const adjustInventory = easternDateKey(soldAt) === easternDateKey();
     const data = await mutateTireShop((shop) => {
       const sale = shop.sales.find((entry) => entry.id === req.params.saleId);
       if (!sale) throw Object.assign(new Error("Sale not found."), { statusCode: 404 });
