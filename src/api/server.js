@@ -1293,6 +1293,9 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
     const inventoryId = shopText(req.body?.inventoryId, 80);
     const quantity = shopNumber(req.body?.quantity, "Sale quantity", { integer: true, min: 1, max: 10000 });
     const unitPrice = shopNumber(req.body?.unitPrice, "Sale price", { max: 100000 });
+    const total = req.body?.totalPrice === undefined
+      ? Math.round(quantity * unitPrice * 100) / 100
+      : shopNumber(req.body.totalPrice, "Total charged", { max: 1000000 });
     const soldAt = new Date(req.body?.soldAt || Date.now());
     if (!Number.isFinite(soldAt.getTime())) throw new Error("Sale date is invalid.");
     if (soldAt.getTime() > Date.now() + 86400000) throw new Error("Sale date cannot be in the future.");
@@ -1316,7 +1319,7 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
         packageType: item?.packageType || "single",
         quantity,
         unitPrice,
-        total: Math.round(quantity * unitPrice * 100) / 100,
+        total,
         soldAt: soldAt.toISOString(),
         customer: shopText(req.body?.customer, 120),
         paymentMethod: shopText(req.body?.paymentMethod || "Other", 40),
@@ -1333,6 +1336,9 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
     const inventoryId = shopText(req.body?.inventoryId, 80);
     const quantity = shopNumber(req.body?.quantity, "Sale quantity", { integer: true, min: 1, max: 10000 });
     const unitPrice = shopNumber(req.body?.unitPrice, "Sale price", { max: 100000 });
+    const total = req.body?.totalPrice === undefined
+      ? Math.round(quantity * unitPrice * 100) / 100
+      : shopNumber(req.body.totalPrice, "Total charged", { max: 1000000 });
     const soldAt = new Date(req.body?.soldAt || Date.now());
     if (!Number.isFinite(soldAt.getTime())) throw new Error("Sale date is invalid.");
     if (soldAt.getTime() > Date.now() + 86400000) throw new Error("Sale date cannot be in the future.");
@@ -1366,7 +1372,7 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
         packageType: item?.packageType || "single",
         quantity,
         unitPrice,
-        total: Math.round(quantity * unitPrice * 100) / 100,
+        total,
         soldAt: soldAt.toISOString(),
         customer: shopText(req.body?.customer, 120),
         paymentMethod: shopText(req.body?.paymentMethod || "Other", 40),
