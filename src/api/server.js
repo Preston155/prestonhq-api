@@ -1085,6 +1085,7 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
     if (!store.credentials.length) return fail(res, 404, "No passkey has been registered yet.");
     const options = await generateAuthenticationOptions({
       rpID: passkeyRPID,
+      timeout: 120000,
       // An empty allow-list enables discoverable credentials. This lets desktop
       // browsers offer Windows Hello, security keys, and cross-device phone login.
       allowCredentials: [],
