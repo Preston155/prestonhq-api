@@ -156,7 +156,7 @@ let tireShopWriteQueue = Promise.resolve();
 
 const passkeyFile = path.join(__dirname, "..", "data", "dashboard-passkeys.json");
 let passkeyWriteQueue = Promise.resolve();
-const passkeyUser = { id: "prestonhq-admin-v1", username: "PrestonHQ Admin" };
+const passkeyUser = { id: "prestonhq-admin-v1", username: "Akron Tire Shop" };
 
 async function readPasskeys() {
   try {
@@ -1032,7 +1032,7 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
   app.post("/api/auth/passkeys/register/options", requireAuth(sessionSecret), asyncRoute(async (req, res) => {
     const store = await readPasskeys();
     const options = await generateRegistrationOptions({
-      rpName: "PrestonHQ",
+      rpName: "Akron Tire Shop",
       rpID: passkeyRPID,
       userID: isoUint8Array.fromUTF8String(passkeyUser.id),
       userName: passkeyUser.username,
@@ -1069,7 +1069,7 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
         webauthnUserID: req.session.passkeyRegistrationUserID,
         deviceType: credentialDeviceType,
         backedUp: credentialBackedUp,
-        name: shopText(req.query?.name || "Face ID / Passkey", 80),
+        name: shopText(req.query?.name || "Akron Tire Shop Passkey", 80),
         createdAt: new Date().toISOString(),
       };
       const index = store.credentials.findIndex((entry) => entry.id === record.id);
@@ -1085,7 +1085,9 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
     if (!store.credentials.length) return fail(res, 404, "No passkey has been registered yet.");
     const options = await generateAuthenticationOptions({
       rpID: passkeyRPID,
-      allowCredentials: store.credentials.map((credential) => ({ id: credential.id, transports: credential.transports || [] })),
+      // An empty allow-list enables discoverable credentials. This lets desktop
+      // browsers offer Windows Hello, security keys, and cross-device phone login.
+      allowCredentials: [],
       userVerification: "required",
     });
     req.session.passkeyAuthenticationChallenge = options.challenge;
@@ -1097,7 +1099,7 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
     if (!expectedChallenge) return fail(res, 400, "Passkey login expired. Try again.");
     const store = await readPasskeys();
     const saved = store.credentials.find((credential) => credential.id === req.body?.id);
-    if (!saved) return fail(res, 401, "This passkey is not registered for PrestonHQ.");
+    if (!saved) return fail(res, 401, "This passkey is not registered for Akron Tire Shop.");
     const verification = await verifyAuthenticationResponse({
       response: req.body,
       expectedChallenge,
@@ -1111,7 +1113,7 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
       },
       requireUserVerification: true,
     });
-    if (!verification.verified) return fail(res, 401, "Face ID or passkey verification failed.");
+    if (!verification.verified) return fail(res, 401, "Passkey verification failed.");
     await mutatePasskeys((nextStore) => {
       const credential = nextStore.credentials.find((entry) => entry.id === saved.id);
       if (credential) {
