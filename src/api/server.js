@@ -250,6 +250,21 @@ function inventoryFields(body, existing = {}) {
   };
 }
 
+const tireWorkTypes = new Set(["tire", "mount", "plug", "rotation", "brakes"]);
+
+function normalizeTireWorkType(value) {
+  const normalized = shopText(value || "tire", 20).toLowerCase();
+  return tireWorkTypes.has(normalized) ? normalized : "tire";
+}
+
+function tireWorkLabel(value) {
+  if (value === "mount") return "Mount";
+  if (value === "plug") return "Plug";
+  if (value === "rotation") return "Rotation";
+  if (value === "brakes") return "Brakes";
+  return "Tire Sale";
+}
+
 function safeSecretMatch(supplied, expected) {
   const left = Buffer.from(String(supplied || ""));
   const right = Buffer.from(String(expected || ""));
@@ -1274,17 +1289,18 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
     ok(res, tireShopResponse(data));
   }));
   app.post("/api/tire-shop/sales", asyncRoute(async (req, res) => {
+    const serviceType = normalizeTireWorkType(req.body?.serviceType);
     const inventoryId = shopText(req.body?.inventoryId, 80);
     const quantity = shopNumber(req.body?.quantity, "Sale quantity", { integer: true, min: 1, max: 10000 });
     const unitPrice = shopNumber(req.body?.unitPrice, "Sale price", { max: 100000 });
     const soldAt = new Date(req.body?.soldAt || Date.now());
     if (!Number.isFinite(soldAt.getTime())) throw new Error("Sale date is invalid.");
     if (soldAt.getTime() > Date.now() + 86400000) throw new Error("Sale date cannot be in the future.");
-    const adjustInventory = easternDateKey(soldAt) === easternDateKey();
+    const adjustInventory = serviceType === "tire" && easternDateKey(soldAt) === easternDateKey();
     const actor = dashboardActor(req);
     const data = await mutateTireShop((shop) => {
-      const item = shop.inventory.find((entry) => entry.id === inventoryId);
-      if (!item) throw Object.assign(new Error("Select a valid inventory item."), { statusCode: 404 });
+      const item = serviceType === "tire" ? shop.inventory.find((entry) => entry.id === inventoryId) : null;
+      if (serviceType === "tire" && !item) throw Object.assign(new Error("Select a valid inventory item."), { statusCode: 404 });
       if (adjustInventory && item.quantity < quantity) throw Object.assign(new Error(`Only ${item.quantity} tire${item.quantity === 1 ? " is" : "s are"} available in stock.`), { statusCode: 409 });
       if (adjustInventory) {
         item.quantity -= quantity;
@@ -1292,11 +1308,12 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
       }
       shop.sales.push({
         id: crypto.randomUUID(),
-        inventoryId: item.id,
-        brand: item.brand,
-        model: item.model,
-        size: item.size,
-        packageType: item.packageType || "single",
+        serviceType,
+        inventoryId: item?.id || "",
+        brand: item?.brand || "",
+        model: item?.model || "",
+        size: item?.size || tireWorkLabel(serviceType),
+        packageType: item?.packageType || "single",
         quantity,
         unitPrice,
         total: Math.round(quantity * unitPrice * 100) / 100,
@@ -1312,13 +1329,14 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
     ok(res, tireShopResponse(data), 201);
   }));
   app.patch("/api/tire-shop/sales/:saleId", asyncRoute(async (req, res) => {
+    const serviceType = normalizeTireWorkType(req.body?.serviceType);
     const inventoryId = shopText(req.body?.inventoryId, 80);
     const quantity = shopNumber(req.body?.quantity, "Sale quantity", { integer: true, min: 1, max: 10000 });
     const unitPrice = shopNumber(req.body?.unitPrice, "Sale price", { max: 100000 });
     const soldAt = new Date(req.body?.soldAt || Date.now());
     if (!Number.isFinite(soldAt.getTime())) throw new Error("Sale date is invalid.");
     if (soldAt.getTime() > Date.now() + 86400000) throw new Error("Sale date cannot be in the future.");
-    const adjustInventory = easternDateKey(soldAt) === easternDateKey();
+    const adjustInventory = serviceType === "tire" && easternDateKey(soldAt) === easternDateKey();
     const data = await mutateTireShop((shop) => {
       const sale = shop.sales.find((entry) => entry.id === req.params.saleId);
       if (!sale) throw Object.assign(new Error("Sale not found."), { statusCode: 404 });
@@ -1331,8 +1349,8 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
         }
       }
 
-      const item = shop.inventory.find((entry) => entry.id === inventoryId);
-      if (!item) throw Object.assign(new Error("Select a valid inventory item."), { statusCode: 404 });
+      const item = serviceType === "tire" ? shop.inventory.find((entry) => entry.id === inventoryId) : null;
+      if (serviceType === "tire" && !item) throw Object.assign(new Error("Select a valid inventory item."), { statusCode: 404 });
       if (adjustInventory && item.quantity < quantity) throw Object.assign(new Error(`Only ${item.quantity} tire${item.quantity === 1 ? " is" : "s are"} available in stock.`), { statusCode: 409 });
       if (adjustInventory) {
         item.quantity -= quantity;
@@ -1340,11 +1358,12 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
       }
 
       Object.assign(sale, {
-        inventoryId: item.id,
-        brand: item.brand,
-        model: item.model,
-        size: item.size,
-        packageType: item.packageType || "single",
+        serviceType,
+        inventoryId: item?.id || "",
+        brand: item?.brand || "",
+        model: item?.model || "",
+        size: item?.size || tireWorkLabel(serviceType),
+        packageType: item?.packageType || "single",
         quantity,
         unitPrice,
         total: Math.round(quantity * unitPrice * 100) / 100,
