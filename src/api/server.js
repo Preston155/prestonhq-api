@@ -1251,6 +1251,14 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
     });
     ok(res, tireShopResponse(data));
   }));
+  app.delete("/api/tire-shop/inventory/:itemId", asyncRoute(async (req, res) => {
+    const data = await mutateTireShop((shop) => {
+      const index = shop.inventory.findIndex((entry) => entry.id === req.params.itemId);
+      if (index === -1) throw Object.assign(new Error("Inventory item not found."), { statusCode: 404 });
+      shop.inventory.splice(index, 1);
+    });
+    ok(res, tireShopResponse(data));
+  }));
   app.post("/api/tire-shop/sales", asyncRoute(async (req, res) => {
     const inventoryId = shopText(req.body?.inventoryId, 80);
     const quantity = shopNumber(req.body?.quantity, "Sale quantity", { integer: true, min: 1, max: 10000 });
@@ -1287,6 +1295,67 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
       });
     });
     ok(res, tireShopResponse(data), 201);
+  }));
+  app.patch("/api/tire-shop/sales/:saleId", asyncRoute(async (req, res) => {
+    const inventoryId = shopText(req.body?.inventoryId, 80);
+    const quantity = shopNumber(req.body?.quantity, "Sale quantity", { integer: true, min: 1, max: 10000 });
+    const unitPrice = shopNumber(req.body?.unitPrice, "Sale price", { max: 100000 });
+    const adjustInventory = req.body?.adjustInventory !== false;
+    const soldAt = new Date(req.body?.soldAt || Date.now());
+    if (!Number.isFinite(soldAt.getTime())) throw new Error("Sale date is invalid.");
+    if (soldAt.getTime() > Date.now() + 86400000) throw new Error("Sale date cannot be in the future.");
+    const data = await mutateTireShop((shop) => {
+      const sale = shop.sales.find((entry) => entry.id === req.params.saleId);
+      if (!sale) throw Object.assign(new Error("Sale not found."), { statusCode: 404 });
+
+      if (sale.adjustInventory !== false) {
+        const originalItem = shop.inventory.find((entry) => entry.id === sale.inventoryId);
+        if (originalItem) {
+          originalItem.quantity += Number(sale.quantity || 0);
+          originalItem.updatedAt = new Date().toISOString();
+        }
+      }
+
+      const item = shop.inventory.find((entry) => entry.id === inventoryId);
+      if (!item) throw Object.assign(new Error("Select a valid inventory item."), { statusCode: 404 });
+      if (adjustInventory && item.quantity < quantity) throw Object.assign(new Error(`Only ${item.quantity} tire${item.quantity === 1 ? " is" : "s are"} available in stock.`), { statusCode: 409 });
+      if (adjustInventory) {
+        item.quantity -= quantity;
+        item.updatedAt = new Date().toISOString();
+      }
+
+      Object.assign(sale, {
+        inventoryId: item.id,
+        brand: item.brand,
+        model: item.model,
+        size: item.size,
+        quantity,
+        unitPrice,
+        total: Math.round(quantity * unitPrice * 100) / 100,
+        soldAt: soldAt.toISOString(),
+        customer: shopText(req.body?.customer, 120),
+        paymentMethod: shopText(req.body?.paymentMethod || "Other", 40),
+        notes: shopText(req.body?.notes, 500),
+        adjustInventory,
+        updatedAt: new Date().toISOString(),
+      });
+    });
+    ok(res, tireShopResponse(data));
+  }));
+  app.delete("/api/tire-shop/sales/:saleId", asyncRoute(async (req, res) => {
+    const data = await mutateTireShop((shop) => {
+      const index = shop.sales.findIndex((entry) => entry.id === req.params.saleId);
+      if (index === -1) throw Object.assign(new Error("Sale not found."), { statusCode: 404 });
+      const [sale] = shop.sales.splice(index, 1);
+      if (sale.adjustInventory !== false) {
+        const item = shop.inventory.find((entry) => entry.id === sale.inventoryId);
+        if (item) {
+          item.quantity += Number(sale.quantity || 0);
+          item.updatedAt = new Date().toISOString();
+        }
+      }
+    });
+    ok(res, tireShopResponse(data));
   }));
 
   app.use("/api/guilds", requireAuth(sessionSecret));
