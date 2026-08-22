@@ -1291,6 +1291,7 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
   app.post("/api/tire-shop/sales", asyncRoute(async (req, res) => {
     const serviceType = normalizeTireWorkType(req.body?.serviceType);
     const inventoryId = shopText(req.body?.inventoryId, 80);
+    const enteredSize = shopText(req.body?.size, 40).toUpperCase();
     const quantity = shopNumber(req.body?.quantity, "Sale quantity", { integer: true, min: 1, max: 10000 });
     const unitPrice = shopNumber(req.body?.unitPrice, "Sale price", { max: 100000 });
     const total = req.body?.totalPrice === undefined
@@ -1303,7 +1304,8 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
     const actor = dashboardActor(req);
     const data = await mutateTireShop((shop) => {
       const item = serviceType === "tire" ? shop.inventory.find((entry) => entry.id === inventoryId) : null;
-      if (serviceType === "tire" && !item) throw Object.assign(new Error("Select a valid inventory item."), { statusCode: 404 });
+      if (adjustInventory && !item) throw Object.assign(new Error("Today's tire sale must use a valid in-stock inventory item."), { statusCode: 404 });
+      if (serviceType === "tire" && !item && !enteredSize) throw new Error("Tire size is required for a historical sale.");
       if (adjustInventory && item.quantity < quantity) throw Object.assign(new Error(`Only ${item.quantity} tire${item.quantity === 1 ? " is" : "s are"} available in stock.`), { statusCode: 409 });
       if (adjustInventory) {
         item.quantity -= quantity;
@@ -1315,7 +1317,7 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
         inventoryId: item?.id || "",
         brand: item?.brand || "",
         model: item?.model || "",
-        size: item?.size || tireWorkLabel(serviceType),
+        size: item?.size || (serviceType === "tire" ? enteredSize : tireWorkLabel(serviceType)),
         packageType: item?.packageType || "single",
         quantity,
         unitPrice,
@@ -1334,6 +1336,7 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
   app.patch("/api/tire-shop/sales/:saleId", asyncRoute(async (req, res) => {
     const serviceType = normalizeTireWorkType(req.body?.serviceType);
     const inventoryId = shopText(req.body?.inventoryId, 80);
+    const enteredSize = shopText(req.body?.size, 40).toUpperCase();
     const quantity = shopNumber(req.body?.quantity, "Sale quantity", { integer: true, min: 1, max: 10000 });
     const unitPrice = shopNumber(req.body?.unitPrice, "Sale price", { max: 100000 });
     const total = req.body?.totalPrice === undefined
@@ -1356,7 +1359,8 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
       }
 
       const item = serviceType === "tire" ? shop.inventory.find((entry) => entry.id === inventoryId) : null;
-      if (serviceType === "tire" && !item) throw Object.assign(new Error("Select a valid inventory item."), { statusCode: 404 });
+      if (adjustInventory && !item) throw Object.assign(new Error("Today's tire sale must use a valid in-stock inventory item."), { statusCode: 404 });
+      if (serviceType === "tire" && !item && !enteredSize) throw new Error("Tire size is required for a historical sale.");
       if (adjustInventory && item.quantity < quantity) throw Object.assign(new Error(`Only ${item.quantity} tire${item.quantity === 1 ? " is" : "s are"} available in stock.`), { statusCode: 409 });
       if (adjustInventory) {
         item.quantity -= quantity;
@@ -1368,7 +1372,7 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
         inventoryId: item?.id || "",
         brand: item?.brand || "",
         model: item?.model || "",
-        size: item?.size || tireWorkLabel(serviceType),
+        size: item?.size || (serviceType === "tire" ? enteredSize : tireWorkLabel(serviceType)),
         packageType: item?.packageType || "single",
         quantity,
         unitPrice,
