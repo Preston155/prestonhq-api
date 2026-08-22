@@ -142,6 +142,101 @@ function dashboardActor(req) {
   };
 }
 
+const tireShopFile = path.join(__dirname, "..", "data", "tire-shop.json");
+const emptyTireShop = () => ({ version: 1, inventory: [], sales: [], updatedAt: new Date().toISOString() });
+let tireShopWriteQueue = Promise.resolve();
+
+function shopText(value, max = 120) {
+  return String(value ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+function shopNumber(value, label, { integer = false, min = 0, max = 1000000 } = {}) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < min || number > max || (integer && !Number.isInteger(number))) {
+    throw new Error(`${label} must be a valid ${integer ? "whole number" : "number"}.`);
+  }
+  return integer ? number : Math.round(number * 100) / 100;
+}
+
+async function readTireShop() {
+  try {
+    const parsed = JSON.parse(await fsPromises.readFile(tireShopFile, "utf8"));
+    return {
+      version: 1,
+      inventory: Array.isArray(parsed.inventory) ? parsed.inventory : [],
+      sales: Array.isArray(parsed.sales) ? parsed.sales : [],
+      updatedAt: parsed.updatedAt || new Date().toISOString(),
+    };
+  } catch (error) {
+    if (error.code === "ENOENT") return emptyTireShop();
+    if (error instanceof SyntaxError) throw new Error("The tire shop data file is invalid JSON.");
+    throw error;
+  }
+}
+
+async function writeTireShop(data) {
+  await fsPromises.mkdir(path.dirname(tireShopFile), { recursive: true });
+  data.updatedAt = new Date().toISOString();
+  const temporaryFile = tireShopFile + ".tmp";
+  await fsPromises.writeFile(temporaryFile, JSON.stringify(data, null, 2) + "\n", { mode: 0o600 });
+  await fsPromises.rename(temporaryFile, tireShopFile);
+  return data;
+}
+
+function mutateTireShop(mutator) {
+  const operation = tireShopWriteQueue.then(async () => {
+    const data = await readTireShop();
+    await mutator(data);
+    return writeTireShop(data);
+  });
+  tireShopWriteQueue = operation.catch(() => undefined);
+  return operation;
+}
+
+function easternDateKey(value = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date(value));
+  const get = (type) => parts.find((part) => part.type === type)?.value || "";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+function tireShopResponse(data) {
+  const inventory = [...data.inventory].sort((a, b) => a.brand.localeCompare(b.brand) || a.size.localeCompare(b.size));
+  const sales = [...data.sales].sort((a, b) => new Date(b.soldAt).getTime() - new Date(a.soldAt).getTime());
+  const today = easternDateKey();
+  const todaysSales = sales.filter((sale) => easternDateKey(sale.soldAt) === today);
+  return {
+    inventory,
+    sales,
+    summary: {
+      skus: inventory.length,
+      units: inventory.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
+      lowStock: inventory.filter((item) => item.quantity <= 5).length,
+      inventoryValue: Math.round(inventory.reduce((sum, item) => sum + Number(item.quantity || 0) * Number(item.price || 0), 0) * 100) / 100,
+      todayUnits: todaysSales.reduce((sum, sale) => sum + Number(sale.quantity || 0), 0),
+      todayRevenue: Math.round(todaysSales.reduce((sum, sale) => sum + Number(sale.total || 0), 0) * 100) / 100,
+      allTimeRevenue: Math.round(sales.reduce((sum, sale) => sum + Number(sale.total || 0), 0) * 100) / 100,
+    },
+    updatedAt: data.updatedAt,
+  };
+}
+
+function inventoryFields(body, existing = {}) {
+  const brand = shopText(body.brand ?? existing.brand, 80);
+  const size = shopText(body.size ?? existing.size, 40).toUpperCase();
+  if (!brand) throw new Error("Tire brand is required.");
+  if (!size) throw new Error("Tire size is required.");
+  return {
+    brand,
+    model: shopText(body.model ?? existing.model, 100),
+    size,
+    quantity: shopNumber(body.quantity ?? existing.quantity, "Quantity", { integer: true, max: 100000 }),
+    cost: shopNumber(body.cost ?? existing.cost ?? 0, "Cost", { max: 100000 }),
+    price: shopNumber(body.price ?? existing.price, "Selling price", { max: 100000 }),
+    location: shopText(body.location ?? existing.location, 80),
+    notes: shopText(body.notes ?? existing.notes, 500),
+  };
+}
+
 function safeSecretMatch(supplied, expected) {
   const left = Buffer.from(String(supplied || ""));
   const right = Buffer.from(String(expected || ""));
@@ -1132,6 +1227,63 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
     const result = await prc.executeCommand(command);
     await moderationStore.addAudit({ action: "raw_command_executed", actor: staff, entityId: null, details: { command } });
     ok(res, { executed: true, command, result }, 201);
+  }));
+
+  // Tire shop routes use the existing dashboard session. There is intentionally
+  // no second PIN or passcode gate inside the inventory and sales tabs.
+  app.use("/api/tire-shop", requireAuth(sessionSecret));
+  app.get("/api/tire-shop", asyncRoute(async (_req, res) => {
+    await tireShopWriteQueue;
+    ok(res, tireShopResponse(await readTireShop()));
+  }));
+  app.post("/api/tire-shop/inventory", asyncRoute(async (req, res) => {
+    const fields = inventoryFields(req.body || {});
+    const now = new Date().toISOString();
+    const data = await mutateTireShop((shop) => {
+      shop.inventory.push({ id: crypto.randomUUID(), ...fields, createdAt: now, updatedAt: now });
+    });
+    ok(res, tireShopResponse(data), 201);
+  }));
+  app.patch("/api/tire-shop/inventory/:itemId", asyncRoute(async (req, res) => {
+    const data = await mutateTireShop((shop) => {
+      const item = shop.inventory.find((entry) => entry.id === req.params.itemId);
+      if (!item) throw Object.assign(new Error("Inventory item not found."), { statusCode: 404 });
+      Object.assign(item, inventoryFields(req.body || {}, item), { updatedAt: new Date().toISOString() });
+    });
+    ok(res, tireShopResponse(data));
+  }));
+  app.post("/api/tire-shop/sales", asyncRoute(async (req, res) => {
+    const inventoryId = shopText(req.body?.inventoryId, 80);
+    const quantity = shopNumber(req.body?.quantity, "Sale quantity", { integer: true, min: 1, max: 10000 });
+    const unitPrice = shopNumber(req.body?.unitPrice, "Sale price", { max: 100000 });
+    const soldAt = new Date(req.body?.soldAt || Date.now());
+    if (!Number.isFinite(soldAt.getTime())) throw new Error("Sale date is invalid.");
+    if (soldAt.getTime() > Date.now() + 86400000) throw new Error("Sale date cannot be in the future.");
+    const actor = dashboardActor(req);
+    const data = await mutateTireShop((shop) => {
+      const item = shop.inventory.find((entry) => entry.id === inventoryId);
+      if (!item) throw Object.assign(new Error("Select a valid inventory item."), { statusCode: 404 });
+      if (item.quantity < quantity) throw Object.assign(new Error(`Only ${item.quantity} tire${item.quantity === 1 ? " is" : "s are"} available in stock.`), { statusCode: 409 });
+      item.quantity -= quantity;
+      item.updatedAt = new Date().toISOString();
+      shop.sales.push({
+        id: crypto.randomUUID(),
+        inventoryId: item.id,
+        brand: item.brand,
+        model: item.model,
+        size: item.size,
+        quantity,
+        unitPrice,
+        total: Math.round(quantity * unitPrice * 100) / 100,
+        soldAt: soldAt.toISOString(),
+        customer: shopText(req.body?.customer, 120),
+        paymentMethod: shopText(req.body?.paymentMethod || "Other", 40),
+        notes: shopText(req.body?.notes, 500),
+        recordedBy: shopText(actor.name, 100) || "Dashboard Admin",
+        createdAt: new Date().toISOString(),
+      });
+    });
+    ok(res, tireShopResponse(data), 201);
   }));
 
   app.use("/api/guilds", requireAuth(sessionSecret));
