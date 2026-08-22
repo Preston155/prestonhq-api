@@ -1256,6 +1256,7 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
     const inventoryId = shopText(req.body?.inventoryId, 80);
     const quantity = shopNumber(req.body?.quantity, "Sale quantity", { integer: true, min: 1, max: 10000 });
     const unitPrice = shopNumber(req.body?.unitPrice, "Sale price", { max: 100000 });
+    const adjustInventory = req.body?.adjustInventory !== false;
     const soldAt = new Date(req.body?.soldAt || Date.now());
     if (!Number.isFinite(soldAt.getTime())) throw new Error("Sale date is invalid.");
     if (soldAt.getTime() > Date.now() + 86400000) throw new Error("Sale date cannot be in the future.");
@@ -1263,9 +1264,11 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
     const data = await mutateTireShop((shop) => {
       const item = shop.inventory.find((entry) => entry.id === inventoryId);
       if (!item) throw Object.assign(new Error("Select a valid inventory item."), { statusCode: 404 });
-      if (item.quantity < quantity) throw Object.assign(new Error(`Only ${item.quantity} tire${item.quantity === 1 ? " is" : "s are"} available in stock.`), { statusCode: 409 });
-      item.quantity -= quantity;
-      item.updatedAt = new Date().toISOString();
+      if (adjustInventory && item.quantity < quantity) throw Object.assign(new Error(`Only ${item.quantity} tire${item.quantity === 1 ? " is" : "s are"} available in stock.`), { statusCode: 409 });
+      if (adjustInventory) {
+        item.quantity -= quantity;
+        item.updatedAt = new Date().toISOString();
+      }
       shop.sales.push({
         id: crypto.randomUUID(),
         inventoryId: item.id,
@@ -1279,6 +1282,7 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
         customer: shopText(req.body?.customer, 120),
         paymentMethod: shopText(req.body?.paymentMethod || "Other", 40),
         notes: shopText(req.body?.notes, 500),
+        adjustInventory,
         recordedBy: shopText(actor.name, 100) || "Dashboard Admin",
         createdAt: new Date().toISOString(),
       });
