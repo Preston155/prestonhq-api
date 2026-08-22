@@ -22,6 +22,14 @@ const { sendGuildMessage } = require("./messageBuilder");
 const prc = require("./prcClient");
 const moderationStore = require("../services/moderationStore");
 const dashboardOperations = require("../services/dashboardOperationsStore");
+const { signAuthToken } = require("./tokenAuth");
+const {
+  generateRegistrationOptions,
+  verifyRegistrationResponse,
+  generateAuthenticationOptions,
+  verifyAuthenticationResponse,
+} = require("@simplewebauthn/server");
+const { isoUint8Array } = require("@simplewebauthn/server/helpers");
 
 const robloxAvatarCache = new Map();
 const ROBLOX_AVATAR_CACHE_MS = 6 * 60 * 60 * 1000;
@@ -145,6 +153,34 @@ function dashboardActor(req) {
 const tireShopFile = path.join(__dirname, "..", "data", "tire-shop.json");
 const emptyTireShop = () => ({ version: 1, inventory: [], sales: [], updatedAt: new Date().toISOString() });
 let tireShopWriteQueue = Promise.resolve();
+
+const passkeyFile = path.join(__dirname, "..", "data", "dashboard-passkeys.json");
+let passkeyWriteQueue = Promise.resolve();
+const passkeyUser = { id: "prestonhq-admin-v1", username: "PrestonHQ Admin" };
+
+async function readPasskeys() {
+  try {
+    const parsed = JSON.parse(await fsPromises.readFile(passkeyFile, "utf8"));
+    return { credentials: Array.isArray(parsed.credentials) ? parsed.credentials : [] };
+  } catch (error) {
+    if (error.code === "ENOENT") return { credentials: [] };
+    throw error;
+  }
+}
+
+function mutatePasskeys(mutator) {
+  const operation = passkeyWriteQueue.then(async () => {
+    const store = await readPasskeys();
+    await mutator(store);
+    const temporaryFile = `${passkeyFile}.${process.pid}.tmp`;
+    await fsPromises.mkdir(path.dirname(passkeyFile), { recursive: true });
+    await fsPromises.writeFile(temporaryFile, JSON.stringify(store, null, 2) + "\n", { mode: 0o600 });
+    await fsPromises.rename(temporaryFile, passkeyFile);
+    return store;
+  });
+  passkeyWriteQueue = operation.catch(() => undefined);
+  return operation;
+}
 
 function shopText(value, max = 120) {
   return String(value ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
@@ -879,6 +915,8 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
   const requireGuildAdmin = createRequireGuildAdmin(client, sessionSecret);
   const authRouter = createAuthRouter({ cookieDomain, cookieSameSite, isProduction, sessionSecret, dashboardPassword });
   const debugRouter = createDebugRouter({ sessionSecret, dashboardPassword });
+  const passkeyRPID = process.env.PASSKEY_RP_ID || "prestonhq.com";
+  const passkeyOrigin = process.env.PASSKEY_ORIGIN || "https://prestonhq.com";
   if (isProduction) app.set("trust proxy", 1);
 
   app.use(cors({
@@ -986,6 +1024,112 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
   }));
   app.post("/api/auth/login", asyncRoute((req, res) => authRouter.login(req, res)));
   app.get("/api/auth/me", authRouter.getAuthMe);
+  app.get("/api/auth/passkeys/status", asyncRoute(async (_req, res) => {
+    const store = await readPasskeys();
+    res.set("Cache-Control", "no-store");
+    ok(res, { available: store.credentials.length > 0, count: store.credentials.length });
+  }));
+  app.post("/api/auth/passkeys/register/options", requireAuth(sessionSecret), asyncRoute(async (req, res) => {
+    const store = await readPasskeys();
+    const options = await generateRegistrationOptions({
+      rpName: "PrestonHQ",
+      rpID: passkeyRPID,
+      userID: isoUint8Array.fromUTF8String(passkeyUser.id),
+      userName: passkeyUser.username,
+      userDisplayName: passkeyUser.username,
+      attestationType: "none",
+      supportedAlgorithmIDs: [-7, -257],
+      excludeCredentials: store.credentials.map((credential) => ({ id: credential.id, transports: credential.transports || [] })),
+      authenticatorSelection: { residentKey: "required", userVerification: "required" },
+      preferredAuthenticatorType: "localDevice",
+    });
+    req.session.passkeyRegistrationChallenge = options.challenge;
+    req.session.passkeyRegistrationUserID = options.user.id;
+    await new Promise((resolve, reject) => req.session.save((error) => error ? reject(error) : resolve()));
+    ok(res, options);
+  }));
+  app.post("/api/auth/passkeys/register/verify", requireAuth(sessionSecret), asyncRoute(async (req, res) => {
+    const expectedChallenge = req.session.passkeyRegistrationChallenge;
+    if (!expectedChallenge) return fail(res, 400, "Passkey registration expired. Try again.");
+    const verification = await verifyRegistrationResponse({
+      response: req.body,
+      expectedChallenge,
+      expectedOrigin: passkeyOrigin,
+      expectedRPID: passkeyRPID,
+      requireUserVerification: true,
+    });
+    if (!verification.verified || !verification.registrationInfo) return fail(res, 400, "Passkey could not be verified.");
+    const { credential, credentialDeviceType, credentialBackedUp } = verification.registrationInfo;
+    await mutatePasskeys((store) => {
+      const record = {
+        id: credential.id,
+        publicKey: Buffer.from(credential.publicKey).toString("base64url"),
+        counter: credential.counter,
+        transports: credential.transports || [],
+        webauthnUserID: req.session.passkeyRegistrationUserID,
+        deviceType: credentialDeviceType,
+        backedUp: credentialBackedUp,
+        name: shopText(req.query?.name || "Face ID / Passkey", 80),
+        createdAt: new Date().toISOString(),
+      };
+      const index = store.credentials.findIndex((entry) => entry.id === record.id);
+      if (index === -1) store.credentials.push(record);
+      else store.credentials[index] = record;
+    });
+    delete req.session.passkeyRegistrationChallenge;
+    delete req.session.passkeyRegistrationUserID;
+    ok(res, { verified: true });
+  }));
+  app.post("/api/auth/passkeys/authenticate/options", asyncRoute(async (req, res) => {
+    const store = await readPasskeys();
+    if (!store.credentials.length) return fail(res, 404, "No passkey has been registered yet.");
+    const options = await generateAuthenticationOptions({
+      rpID: passkeyRPID,
+      allowCredentials: store.credentials.map((credential) => ({ id: credential.id, transports: credential.transports || [] })),
+      userVerification: "required",
+    });
+    req.session.passkeyAuthenticationChallenge = options.challenge;
+    await new Promise((resolve, reject) => req.session.save((error) => error ? reject(error) : resolve()));
+    ok(res, options);
+  }));
+  app.post("/api/auth/passkeys/authenticate/verify", asyncRoute(async (req, res) => {
+    const expectedChallenge = req.session.passkeyAuthenticationChallenge;
+    if (!expectedChallenge) return fail(res, 400, "Passkey login expired. Try again.");
+    const store = await readPasskeys();
+    const saved = store.credentials.find((credential) => credential.id === req.body?.id);
+    if (!saved) return fail(res, 401, "This passkey is not registered for PrestonHQ.");
+    const verification = await verifyAuthenticationResponse({
+      response: req.body,
+      expectedChallenge,
+      expectedOrigin: passkeyOrigin,
+      expectedRPID: passkeyRPID,
+      credential: {
+        id: saved.id,
+        publicKey: new Uint8Array(Buffer.from(saved.publicKey, "base64url")),
+        counter: Number(saved.counter || 0),
+        transports: saved.transports || [],
+      },
+      requireUserVerification: true,
+    });
+    if (!verification.verified) return fail(res, 401, "Face ID or passkey verification failed.");
+    await mutatePasskeys((nextStore) => {
+      const credential = nextStore.credentials.find((entry) => entry.id === saved.id);
+      if (credential) {
+        credential.counter = verification.authenticationInfo.newCounter;
+        credential.lastUsedAt = new Date().toISOString();
+      }
+    });
+    const loginTime = new Date().toISOString();
+    const user = { id: "dashboard-admin", username: "Admin", globalName: "PrestonHQ Admin", avatar: null };
+    req.session.user = user;
+    req.session.dashboardAuth = true;
+    req.session.guilds = [];
+    req.session.loginTime = loginTime;
+    delete req.session.passkeyAuthenticationChallenge;
+    const token = signAuthToken({ user, guilds: [], loginTime, dashboardAuth: true }, sessionSecret);
+    await new Promise((resolve, reject) => req.session.save((error) => error ? reject(error) : resolve()));
+    ok(res, { authenticated: true, verified: true, user, token, loginTime });
+  }));
   app.get("/api/auth/validate-sso", (req, res) => {
     ok(res, {
       authenticated: Boolean(req.session?.authenticated),

@@ -10,6 +10,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@simplewebauthn/server": "^13.3.2",
     "cors": "^2.8.6",
     "discord.js": "^14.25.1",
     "dotenv": "^16.6.1",
