@@ -223,10 +223,9 @@ function tireShopResponse(data) {
 function inventoryFields(body, existing = {}) {
   const brand = shopText(body.brand ?? existing.brand, 80);
   const size = shopText(body.size ?? existing.size, 40).toUpperCase();
-  if (!brand) throw new Error("Tire brand is required.");
   if (!size) throw new Error("Tire size is required.");
   return {
-    brand,
+    brand: brand || "Tire",
     model: shopText(body.model ?? existing.model, 100),
     size,
     quantity: shopNumber(body.quantity ?? existing.quantity, "Quantity", { integer: true, max: 100000 }),
