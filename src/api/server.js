@@ -199,8 +199,19 @@ function easternDateKey(value = new Date()) {
   return `${get("year")}-${get("month")}-${get("day")}`;
 }
 
+function tireRimDiameter(size) {
+  const text = String(size || "").toUpperCase();
+  const radial = text.match(/R\s*(\d{2}(?:\.\d)?)/);
+  if (radial) return Number(radial[1]);
+  const candidates = (text.match(/\d+(?:\.\d+)?/g) || []).map(Number).filter((number) => number >= 10 && number <= 30);
+  return candidates.length ? candidates[candidates.length - 1] : 999;
+}
+
 function tireShopResponse(data) {
-  const inventory = [...data.inventory].sort((a, b) => a.brand.localeCompare(b.brand) || a.size.localeCompare(b.size));
+  const packageOrder = { set4: 0, pair: 1, single: 2 };
+  const inventory = [...data.inventory].sort((a, b) => tireRimDiameter(a.size) - tireRimDiameter(b.size)
+    || String(a.size).localeCompare(String(b.size), undefined, { numeric: true, sensitivity: "base" })
+    || (packageOrder[a.packageType] ?? 9) - (packageOrder[b.packageType] ?? 9));
   const sales = [...data.sales].sort((a, b) => new Date(b.soldAt).getTime() - new Date(a.soldAt).getTime());
   const today = easternDateKey();
   const todaysSales = sales.filter((sale) => easternDateKey(sale.soldAt) === today);
@@ -223,11 +234,14 @@ function tireShopResponse(data) {
 function inventoryFields(body, existing = {}) {
   const brand = shopText(body.brand ?? existing.brand, 80);
   const size = shopText(body.size ?? existing.size, 40).toUpperCase();
+  const requestedPackageType = shopText(body.packageType ?? existing.packageType ?? "single", 20).toLowerCase();
+  const packageType = ["set4", "pair", "single"].includes(requestedPackageType) ? requestedPackageType : "single";
   if (!size) throw new Error("Tire size is required.");
   return {
     brand: brand || "Tire",
     model: shopText(body.model ?? existing.model, 100),
     size,
+    packageType,
     quantity: shopNumber(body.quantity ?? existing.quantity, "Quantity", { integer: true, max: 100000 }),
     cost: shopNumber(body.cost ?? existing.cost ?? 0, "Cost", { max: 100000 }),
     price: shopNumber(body.price ?? existing.price, "Selling price", { max: 100000 }),
@@ -1282,6 +1296,7 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
         brand: item.brand,
         model: item.model,
         size: item.size,
+        packageType: item.packageType || "single",
         quantity,
         unitPrice,
         total: Math.round(quantity * unitPrice * 100) / 100,
@@ -1329,6 +1344,7 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
         brand: item.brand,
         model: item.model,
         size: item.size,
+        packageType: item.packageType || "single",
         quantity,
         unitPrice,
         total: Math.round(quantity * unitPrice * 100) / 100,
