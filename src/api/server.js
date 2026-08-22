@@ -1126,7 +1126,7 @@ function createApiServer({ client, port = 3001, frontendOrigin = "https://api.pr
     req.session.guilds = [];
     req.session.loginTime = loginTime;
     delete req.session.passkeyAuthenticationChallenge;
-    const token = signAuthToken({ user, guilds: [], loginTime, dashboardAuth: true }, sessionSecret);
+    const token = signAuthToken({ user, guilds: [], loginTime, dashboardAuth: true }, sessionSecret, 60 * 60 * 24 * 365);
     await new Promise((resolve, reject) => req.session.save((error) => error ? reject(error) : resolve()));
     ok(res, { authenticated: true, verified: true, user, token, loginTime });
   }));
